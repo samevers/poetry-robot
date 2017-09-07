@@ -1,0 +1,184 @@
+#!/usr/bin/python
+#coding:gbk
+import sys,os
+#sys.path.append(".")
+import tensorflow as tf
+#sys.path.append("./tensorflow/python/ops")
+#import rnn_cell
+#import seq2seq
+#from tensorflow.python.ops import rnn_cell
+#from tensorflow.python.ops import seq2seq
+
+from tensorflow.contrib.rnn.python.ops import core_rnn_cell
+from tensorflow.contrib.legacy_seq2seq.python.ops import seq2seq
+from tensorflow.python import nn
+
+import numpy as np
+class Model():
+    def __init__(self, args, infer=False):
+        self.args = args
+        if infer:
+            args.batch_size = 1
+            args.seq_length = 1
+
+        if args.model == 'rnn':
+            cell_fn = core_rnn_cell.BasicRNNCell
+        elif args.model == 'gru':
+            cell_fn = core_rnn_cell.GRUCell
+        elif args.model == 'lstm':
+            cell_fn = core_rnn_cell.BasicLSTMCell
+        else:
+            raise Exception("model type not supported: {}".format(args.model))
+
+        cell = cell_fn(args.rnn_size, state_is_tuple=True)
+
+        self.cell = cell = core_rnn_cell.MultiRNNCell([cell] * args.num_layers, state_is_tuple=True) 
+
+        self.input_data = tf.placeholder(tf.int32, [args.batch_size, args.seq_length], name="input_data")
+        self.targets = tf.placeholder(tf.int32, [args.batch_size, args.seq_length], name="targets")
+        self.initial_state = cell.zero_state(args.batch_size, tf.float32)
+
+        with tf.variable_scope('rnnlm'):
+            softmax_w = tf.get_variable("softmax_w", [args.rnn_size, args.vocab_size])
+            softmax_b = tf.get_variable("softmax_b", [args.vocab_size])
+            with tf.device("/cpu:0"):
+                embedding = tf.get_variable("embedding", [args.vocab_size, args.rnn_size])
+                print "seq_length = ", args.seq_length, "embedding_lookup = ", tf.nn.embedding_lookup(embedding, self.input_data)
+                #inputs = tf.split(1, args.seq_length, tf.nn.embedding_lookup(embedding, self.input_data))
+                inputs = tf.split( tf.nn.embedding_lookup(embedding, self.input_data)  , args.seq_length,1)
+                print "inputs 1:",inputs
+                inputs = [tf.squeeze(input_, [1]) for input_ in inputs]
+                print "inputs 2:",inputs
+        def loop(prev, _):
+            prev = tf.matmul(prev, softmax_w) + softmax_b
+            prev_symbol = tf.stop_gradient(tf.argmax(prev, 1))
+            return tf.nn.embedding_lookup(embedding, prev_symbol)
+
+        # yonghua
+        # inputs, initial_state, cell, scope
+        outputs, last_state = seq2seq.rnn_decoder(inputs, self.initial_state, cell, loop_function=loop if infer else None, scope='rnnlm')
+        #sys.stdout.write("outputs : %s\tlast_state : %s" % (outputs, last_state))
+        #output = tf.reshape(tf.concat(1, outputs), [-1, args.rnn_size])
+        output = tf.reshape(tf.concat(outputs,1), [-1, args.rnn_size])
+        self.logits = tf.matmul(output, softmax_w) + softmax_b
+        self.probs = tf.nn.softmax(self.logits, name="prob_results")
+        loss = seq2seq.sequence_loss_by_example([self.logits],
+                [tf.reshape(self.targets, [-1])],
+                [tf.ones([args.batch_size * args.seq_length])],
+                args.vocab_size)
+        self.cost = tf.reduce_sum(loss) / args.batch_size / args.seq_length
+        self.final_state = last_state
+        self.lr = tf.Variable(0.0, trainable=False,name="LR_")
+        tvars = tf.trainable_variables()
+        grads, _ = tf.clip_by_global_norm(tf.gradients(self.cost, tvars),
+                args.grad_clip)
+        optimizer = tf.train.AdamOptimizer(self.lr)
+        self.train_op = optimizer.apply_gradients(zip(grads, tvars))
+
+    def sample(self, sess, chars, vocab, filename, num = 200, imageid=-1, webid=-1, prime='The ', sampling_type=1):
+        state = sess.run(self.cell.zero_state(1, tf.float32))
+        with open(filename, 'r') as f:
+              for line in f.readlines():
+                tmp = line.strip()
+                #print tmp,type(tmp)
+                #line = "^" + line + "$"
+                try:
+                  line = line.strip().decode("gbk")
+                except:
+                  continue
+                prime = line
+
+                for char in prime[:len(prime)]:
+                    x = np.zeros((1, 1))
+                    if char not in vocab:
+                      continue
+                    try:
+                      x[0, 0] = vocab[char]
+                    except:
+                      continue
+                    print "char:",char.encode("gbk"),"weight:",x
+                    feed = {self.input_data: x, self.initial_state:state}
+                    #[state] = sess.run([self.final_state], feed)
+                    [probs, state] = sess.run([self.probs, self.final_state], feed)
+
+                    p = probs[0]
+                    ## image or web ?
+                    imageScore = p[imageid]
+                    webScore = p[webid]
+                    print("imageScore = ",imageScore)
+                    print("webScore = ", webScore)
+
+                def weighted_pick(weights):
+                    t = np.cumsum(weights)
+                    s = np.sum(weights)
+                    return(int(np.searchsorted(t, np.random.rand(1)*s)))
+        
+                ret = prime
+                if len(prime) == 0:
+                  continue
+                char = prime[-1]
+                x = np.zeros((1, 1))
+                if char not in vocab:
+                  continue
+                try:
+                  x[0, 0] = vocab[char]
+                except:
+                  continue
+
+                print "char:",char.encode("gbk"),"weight:",x
+                feed = {self.input_data: x, self.initial_state:state}
+                print "feed: ",feed
+                #for xv in feed:
+                #    for e in xv:
+                #        print e
+                #    print ""
+                [probs, state] = sess.run([self.probs, self.final_state], feed)
+        
+                print "size of probs:", len(probs)# == 1
+                p = probs[0]
+                print "size of p:", len(p)          # == sizeof(vocab)
+                ## image or web ?
+                imageScore = p[imageid]
+                webScore = p[webid]
+                for i in range(0,len(p)):
+                    print "score = ",p[i]
+                print("imageScore = ",imageScore)
+                print("webScore = ", webScore)
+                exit()
+                
+                subpMax = 0
+                subpMaxId = 0
+                idd = 0
+                while idd < len(chars):
+                    if idd < 0 or idd > len(p):
+                        continue
+                    subp = p[idd]
+                    if subpMax < subp:
+                        subpMax = subp
+                        subpMaxId = idd
+                    idd += 1
+                thres = -1
+                if webScore > 0:
+                  thres = imageScore/webScore
+                elif imageScore > 0:
+                  thres = 1
+                
+                maxid = -1
+                if imageScore > webScore:
+                  cla = "IMAGE"
+                  maxid = imageid
+                else:
+                  cla = "WEB"
+                  maxid = webid
+                
+        
+                pred = chars[maxid]
+                ret += pred
+                char = pred
+                print tmp,"\t",pred,"imageScore=",imageScore,"webScore=",webScore,"thres=",thres,"maxProb = ",subpMax,"subpMax content = ",chars[subpMaxId].encode("gbk")
+                #print tmp,"\t",pred,"imageScore=",imageScore,"webScore=",webScore,"thres=",thres
+                #print (line.encode("gbk"),"\t",ret.encode("gbk"))
+                exit()
+        return 0
+
+
